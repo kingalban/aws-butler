@@ -12,10 +12,11 @@ pip install aws-butler
 ~~~
 
 
+List logs in a log-group
+
 ~~~
 # Authenticate with aws sso login ... or however you prefer
 
-# List logs in a log-group
 cloudwatch --profile <my-profile> --log-group-name log-gang ls
 
 | name                                              | created at          | latest event at     | duration   |
@@ -27,9 +28,10 @@ cloudwatch --profile <my-profile> --log-group-name log-gang ls
 | my-ecs-task/work/ff443f4aaaa445beacb48425dca20db5 | 2024-01-15 03:00:36 | 2024-01-01 03:06:34 | 0:04:21    |
 ~~~
 
-~~~
 
-# Tail all logs in that group:
+Tail all logs in that group:
+
+~~~
 cloudwatch --profile <my-profile> --log-group-name log-gang tail 
 #   Page through logs
 #   ...
@@ -37,8 +39,38 @@ cloudwatch --profile <my-profile> --log-group-name log-gang tail
 ~~~
 
 
-~~~
-# get parameters from ssm into a .env file
+get parameters from ssm into a .env file:
 
-parameters --profile <my-profile> pull --path '/path/in/' > .env
+~~~
+parameters --profile <my-profile> pull .env --path '/path/in/ssm'
+~~~
+
+
+Push parameters from a local .env file to ssm
+
+~~~
+parameters --profile <my-profile> push .env --path '/path/in/ssm'
+unchanged:
+        "/stage/db/my_fist_pets_name":    "values that"
+        "/stage/db/my_second_pets_name":  "are the same in ssm"
+        "/stage/db/my_third_pets_name":   "as in the local file"
+        ... 4 more unchanged
+
+to add:
+        "/stage/db/secret_ingredient":  "potato"
+
+to change:
+        "/stage/db/master_password":  "qwerty" -> "ytrewq"
+
+4 unchanged, 1 new, 1 changed
+
+Are you sure you want to perform these actions?
+Only 'yes' will accepted.
+
+Enter a value: yes
+applying...
+successfully put parameter "/stage/db/master_password"
+successfully put parameter "/stage/db/secret_ingredient"
+
+Done! put 2 parameters
 ~~~

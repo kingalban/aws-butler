@@ -1,18 +1,38 @@
-#! /usr/bin/env python
 from __future__ import annotations
 
 """
-A script to list and read aws cloudwatch logs
+A script to list, read, and write aws SSM parameter store
 """
 
+import os
+import re
+import json
 import click
 import boto3
+from itertools import chain
 from tabulate import tabulate
 from datetime import datetime
+from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+diff_summary = namedtuple("diff_summary", "unchanged new changed")
+change = namedtuple("change", "old new")
 
-def get_client(profile_name, resource_name):
+
+def is_valid_ssm_name(name: str) -> tuple[bool, str]:
+    ALLOWED = "[a-zA-Z0-9_.-]"
+    if len(name) > 1011:
+        return False, "name cannot be longer than 1011 chars"
+    if name.count("/") > 14:
+        return False, "name cannot have more than 14 levels of hierachy"
+    if re.match("(?i)/?(aws)|(ssm)", name):
+        return False, "name cannot start with 'aws' or 'ssm'"
+    if not re.match(f"^(/?(?=(?P<p1>{ALLOWED}+))(?P=p1))+$", name):
+        return False, "name uses an illegal character or pattern"
+    return True, "name is valid"
+
+
+def get_client(profile_name: str, resource_name: str) -> aws:
     session = boto3.Session(profile_name=profile_name)
     return session.client(resource_name)
 
@@ -28,39 +48,147 @@ def get_parameter(client, parameter_name):
 def get_parameters(profile_name, parameter_names):
     results = {}
     client = get_client(profile_name, "ssm")
+
     with ThreadPoolExecutor() as executor:
         futures = {executor.submit(get_parameter, client, name): name for name in parameter_names}
         for future in as_completed(futures):
             if exc := future.exception():
                 raise exc
             results[futures[future]] = future.result()
-            click.echo(f"got result for {futures[future]}...", err=True)
 
     return results
 
 
-def walk_parameters(profile_name, path=None, limit=None, *, get_value=False):
-    """Generate parameters from parameter store, optionally filtered by a path"""
-    filters = [{"Key": "Path", "Values": [path]}] if path else []
+def put_parameter(client, name: str, value: str, param_type: str,
+                  description: str | None = None, *, overwrite=False) -> str:
+    if param_type not in ('String', 'StringList', 'SecureString'):
+        raise ValueError(f"param type = {param_type} not accepted")
 
-    client = get_client(profile_name, "ssm")
-
-    page_iterator = (
-        client
-        .get_paginator("describe_parameters")
-        .paginate(ParameterFilters=filters, PaginationConfig={"MaxItems": limit})
+    client.put_parameter(
+        Name=name,
+        Description=description or "",
+        Value=value,
+        Type=param_type,
+        Overwrite=overwrite,
     )
+    return name
 
-    for page in page_iterator:
-        parameters = page["Parameters"]
-        if get_value:
-            results = get_parameters(profile_name, (param["Name"] for param in parameters))
 
-            for param in parameters:
-                param["Value"] = results[param["Name"]]
-                yield param
+def put_parameters(profile_name: str, parameters: dict[str: str]) -> int:
+    client = get_client(profile_name, "ssm")
+    n_applied = 0
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(put_parameter, client, name, value, "SecureString", overwrite=True)
+                   for name, value in parameters.items()]
+
+        for future in as_completed(futures):
+            if exc := future.exception():
+                raise exc
+            else:
+                n_applied += 1
+                click.echo(f"successfully put parameter {future.result()}", err=True)
+
+    return n_applied
+
+
+def walk_parameters(profile_name: str,
+                    path: tuple[str | None] | None = None,
+                    limit: int | None=None,
+                    *,
+                    get_value: bool =False):
+    """Generate parameters from parameter store, optionally filtered by a path
+
+        The path can be full or partial, eg: '/path/to' or '/path/to/value'
+    """
+    client = get_client(profile_name, "ssm")
+    path = path if path else (None, )
+
+    def walk():
+        for _path in path:
+            if _path:
+                full_path_filter = [{"Key": "Name", "Values": [_path]}]
+                partial_path_filter = [{"Key": "Path", "Values": [_path]}]
+                filters = (partial_path_filter, full_path_filter)
+            else:
+                filters = ([],)
+
+            for param_filter in filters:
+                page_iterator = (
+                    client
+                    .get_paginator("describe_parameters")
+                    .paginate(ParameterFilters=param_filter, PaginationConfig={"MaxItems": limit})
+                )
+
+                for page in page_iterator:
+                    parameters = page["Parameters"]
+                    if get_value:
+                        results = get_parameters(profile_name, (param["Name"] for param in parameters))
+
+                        for param in parameters:
+                            param["Value"] = results[param["Name"]]
+                            yield param
+                    else:
+                        for param in parameters:
+                            yield param
+
+    yielded_param_names = set()
+
+    for param in walk():
+        if param["Name"] not in yielded_param_names:
+            yield param
+            yielded_param_names.add(param["Name"])
+
+
+def diff_params(local_params: dict[str: str], remote_params: dict[str: str]) -> diff_summary:
+    unchanged = {}
+    changed = {}
+    new = {}
+    for local_key, local_value in local_params.items():
+        if local_key in remote_params:
+            if local_value == remote_params[local_key]:
+                unchanged[local_key] = local_value
+            else:
+                changed[local_key] = change(old=remote_params[local_key], new=local_value)
         else:
-            yield from parameters
+            new[local_key] = local_value
+
+    click.echo()
+
+    if unchanged:
+        click.secho("unchanged:", bold=True)
+        rows = []
+        for key, val in list(unchanged.items())[:3]:
+            rows.append((click.style(f"\t\"{key}\":", dim=True),
+                         click.style(f"\"{val}\"", dim=True)))
+        click.echo(tabulate(rows, tablefmt="plain"))
+
+        if len(unchanged) > 3:
+            click.secho(f"\t... {len(unchanged) - 3} more unchanged", dim=True)
+        click.echo()
+
+    if new:
+        click.secho("to add:", bold=True)
+        rows = []
+        for key, val in new.items():
+            rows.append((click.style(f"\t\"{key}\":", fg='white'),
+                         f"\"{click.style(val, fg='green')}\""))
+        click.echo(tabulate(rows, tablefmt="plain"))
+        click.echo()
+
+    if changed:
+        click.secho("to change:", bold=True)
+        rows = []
+        for key, _change in changed.items():
+            rows.append((click.style(f"\t\"{key}\":", fg='white'),
+                        f"\"{click.style(_change.old, fg='yellow')}\" -> \"{click.style(_change.new, fg='green')}\""))
+        click.echo(tabulate(rows, tablefmt="plain"))
+        click.echo()
+
+    click.echo(f"{len(unchanged)} unchanged, "
+               f"{click.style(len(new), fg='green')} new, "
+               f"{click.style(len(changed), fg='yellow')} changed\n")
+
+    return diff_summary(unchanged=unchanged, new=new, changed=changed)
 
 
 @click.group()
@@ -72,29 +200,59 @@ def cli(ctx, **kwargs):
 
 
 @cli.command()
-@click.option("--path", type=str, help="SSM parameter path (or part of)")
+@click.argument("NAMES", type=str, nargs=-1)
+@click.option("--path", default="", help="path to prepend to name(s)")
+def check_name(names, path):
+    """Check if a name is a valid SSM parameter name"""
+    any_invalid = False
+    for name in names:
+        name = os.path.join(path, name)
+        is_valid, message = is_valid_ssm_name(name)
+        if is_valid:
+            click.echo(f"{name!r} is valid {click.style('✓', fg='green', bold=True)}")
+        else:
+            click.echo(f"{name!r} is not valid: {message} {click.style('x', fg='red', bold=True)}")
+            any_invalid = True
+
+    if any_invalid:
+        raise click.ClickException("one or more names were invalid")
+
+
+@cli.command()
+@click.option("--path", type=str, multiple=True, help="SSM parameter path (or part of)")
 @click.option("-n", "--lines", type=int)
 @click.option("--sort", type=click.Choice(("name", "modified", ""), case_sensitive=False), default="")
+@click.option("--pager/--no-pager", default=True)
+@click.option("--format", type=click.Choice(("table", "json", "names")), default="table")
 @click.pass_context
-def ls(ctx, path, lines, sort):
+def ls(ctx, path, lines, sort, pager, format):
     """List parameters"""
+
     parameters = walk_parameters(ctx.obj["profile"], path, lines)
 
     rows = ({"name": param["Name"],
              "type": param["Type"],
              "description": param.get("Description", ""),
-             "modified at": param["LastModifiedDate"]}
+             "modified-at": param["LastModifiedDate"]}
             for param in parameters)
 
     if sort:
         rows = sorted(rows, key=lambda line: line[{"name": "name", "modified": "modified at"}[sort]])
 
-    click.echo(tabulate(rows, headers="keys", tablefmt="orgtbl"))
+    if format == "table":
+        str_to_print = tabulate(rows, headers="keys", tablefmt="orgtbl")
+    elif format == "json":
+        str_to_print = json.dumps(list(rows), indent=2, default=str
+    elif format == "names":
+        str_to_print = "\n".join(row["name"] for row in rows)
+
+    echo_fcn = click.echo_via_pager if pager else click.echo
+    echo_fcn(str_to_print)
 
 
 @cli.command()
 @click.argument("env_file", type=click.File("w"), default="-")
-@click.option("--path", type=str, help="SSM parameter path (or part of)")
+@click.option("--path", multiple=True, type=str, help="SSM parameter path (or part of)")
 @click.option("--decrypt/--no-decrypt", default=True)
 @click.pass_context
 def pull(ctx, env_file, path, decrypt):
@@ -108,24 +266,60 @@ def pull(ctx, env_file, path, decrypt):
 @cli.command()
 @click.argument("env_file", type=click.File("r"), default="-")
 @click.option("--path", type=str, help="SSM parameter path (or part of)")
+@click.option("--dry-run", is_flag=True, default=False)
 @click.pass_context
-def push(ctx, env_file, path):
-    """Push parameters from a .env file to SSM"""
+def push(ctx, env_file, path, dry_run):
+    """Push parameters from a .env file to SSM
+
+       All values will be stored as SecureString
+    """
     local_params = {}
 
     while line := env_file.readline():
+        line = line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
         if "=" not in line:
             raise ValueError(f"badly formatted .env file. expected '=' but not found on {line=}")
+
         name, _, value = line.partition("=")
-        local_params[name.strip().lower()] = value.strip()
+        param_name = os.path.join(path, name.strip().lower())
+
+        is_valid, message = is_valid_ssm_name(param_name)
+        if not is_valid:
+            raise ValueError(f"parameter {param_name!r} is not valid. {message}")
+
+        local_params[param_name] = value.strip()
 
     remote_params = {
-        param["Name"]: param for param in
-        walk_parameters(ctx.obj["profile"], path=path, get_value=True)
+        param["Name"]: param["Value"]["Value"] for param in
+        walk_parameters(ctx.obj["profile"], path=local_params.keys(), get_value=True)
     }
 
-    for key in set(remote_params) | set(local_params):
-        click.echo(f"{key} {local_params.get(key)} {remote_params.get(key)}")
+    diff = diff_params(local_params, remote_params)
+
+    if dry_run:
+        click.echo("No changes made")
+        return
+
+    if diff.new or diff.changed:
+        click.echo()
+        answer = click.prompt("Are you sure you want to perform these actions?\n"
+                              "Only 'yes' will accepted.\n\n"
+                              f"{click.style('Enter a value', bold=True)}")
+        if answer == 'yes':
+            click.echo("applying...")
+            params_to_apply = {**diff.new, **{name: chg.new for name, chg in diff.changed.items()}}
+            n_applied = put_parameters(ctx.obj["profile"], params_to_apply)
+            click.echo(f"Done! put {n_applied} parameters")
+
+        else:
+            click.echo("cancelling...")
+
+    else:
+        click.echo("Nothing to do")
 
 
 def main():
