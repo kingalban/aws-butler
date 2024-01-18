@@ -242,7 +242,7 @@ def ls(ctx, path, lines, sort, pager, format):
     if format == "table":
         str_to_print = tabulate(rows, headers="keys", tablefmt="orgtbl")
     elif format == "json":
-        str_to_print = json.dumps(list(rows), indent=2, default=str
+        str_to_print = json.dumps(list(rows), indent=2, default=str)
     elif format == "names":
         str_to_print = "\n".join(row["name"] for row in rows)
 
