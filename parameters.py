@@ -9,30 +9,38 @@ import re
 import json
 import click
 import boto3
-from itertools import chain
+import botocore.client
+import dotenv
 from tabulate import tabulate
 from datetime import datetime
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Generator
 
 diff_summary = namedtuple("diff_summary", "unchanged new changed")
 change = namedtuple("change", "old new")
 
 
 def is_valid_ssm_name(name: str) -> tuple[bool, str]:
-    ALLOWED = "[a-zA-Z0-9_.-]"
+    allowed = "[a-zA-Z0-9_.-]"
+    arn_path = f"(?P<arn>arn:aws:ssm:\\w+-\\w+-\\d+:\\d+:parameter)?(?P<path>.+)"
+    if arn_path_match := re.match(arn_path, name):
+        arn, path = arn_path_match.groups()
+
     if len(name) > 1011:
         return False, "name cannot be longer than 1011 chars"
-    if name.count("/") > 14:
-        return False, "name cannot have more than 14 levels of hierachy"
-    if re.match("(?i)/?(aws)|(ssm)", name):
+    if name.count("/") > 15:
+        return False, "name cannot have more than 15 levels of hierachy"
+    if re.match("(?i)/?(aws)|(ssm)", path):
         return False, "name cannot start with 'aws' or 'ssm'"
-    if not re.match(f"^(/?(?=(?P<p1>{ALLOWED}+))(?P=p1))+$", name):
+    if not re.match(f"^(/|{allowed})+$", path):
         return False, "name uses an illegal character or pattern"
+    if not path.startswith("/") and "/" in path:
+        return False, "name must be fully qualified path"
     return True, "name is valid"
 
 
-def get_client(profile_name: str, resource_name: str) -> aws:
+def get_client(profile_name: str, resource_name: str) -> botocore.client.S3:
     session = boto3.Session(profile_name=profile_name)
     return session.client(resource_name)
 
@@ -92,7 +100,7 @@ def put_parameters(profile_name: str, parameters: dict[str: str]) -> int:
 
 
 def walk_parameters(profile_name: str,
-                    path: tuple[str | None] | None = None,
+                    path: tuple[str | None, ...] | None = None,
                     limit: int | None=None,
                     *,
                     get_value: bool =False):
@@ -139,7 +147,7 @@ def walk_parameters(profile_name: str,
             yielded_param_names.add(param["Name"])
 
 
-def diff_params(local_params: dict[str: str], remote_params: dict[str: str]) -> diff_summary:
+def diff_params(local_params: dict[str, str], remote_params: dict[str, str]) -> diff_summary:
     unchanged = {}
     changed = {}
     new = {}
@@ -274,17 +282,7 @@ def push(ctx, env_file, path, dry_run):
        All values will be stored as SecureString
     """
     local_params = {}
-
-    while line := env_file.readline():
-        line = line.strip()
-
-        if not line or line.startswith("#"):
-            continue
-
-        if "=" not in line:
-            raise ValueError(f"badly formatted .env file. expected '=' but not found on {line=}")
-
-        name, _, value = line.partition("=")
+    for name, value in dotenv.dotenv_values(stream=env_file).items():
         param_name = os.path.join(path, name.strip().lower())
 
         is_valid, message = is_valid_ssm_name(param_name)
@@ -295,7 +293,7 @@ def push(ctx, env_file, path, dry_run):
 
     remote_params = {
         param["Name"]: param["Value"]["Value"] for param in
-        walk_parameters(ctx.obj["profile"], path=local_params.keys(), get_value=True)
+        walk_parameters(ctx.obj["profile"], path=tuple(local_params.keys()), get_value=True)
     }
 
     diff = diff_params(local_params, remote_params)
